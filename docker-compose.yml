@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  hybrid-rag-app:
+    build: .
+    container_name: hybrid_rag_gemini_app
+    ports:
+      - "8501:8501"
+    environment:
+      - GEMINI_API_KEY=your_actual_gemini_api_key_here
+    volumes:
+      - ./chroma_db_store:/app/chroma_db_store
+      - ./uploaded_files:/app/uploaded_files
+    restart: unless-stopped

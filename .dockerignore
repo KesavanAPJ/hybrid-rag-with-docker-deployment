@@ -1,0 +1,27 @@
+# Version control
+.git
+.gitignore
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.env
+
+# Streamlit config / cache
+.streamlit/
+
+# Local data stores (optional: comment these out if you *want* local dev data copied during build)
+# chroma_db_store/
+# uploaded_files/
+
+# IDE and OS specific files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,323 @@
+import os
+import re
+import streamlit as st
+import networkx as nx
+import matplotlib.pyplot as plt
+import pypdf
+from docx import Document as DocxDocument
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
+
+# Look for GEMINI_API_KEY or GOOGLE_API_KEY
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+if GEMINI_API_KEY:
+    os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CHROMA_DIR = os.path.join(APP_DIR, "chroma_db_store")
+UPLOAD_DIR = os.path.join(APP_DIR, "uploaded_files")
+GRAPH_PATH = os.path.join(CHROMA_DIR, "knowledge_graph.graphml")
+
+# LangChain & NetworkX Imports (Google GenAI Integration)
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_chroma import Chroma
+from langchain_experimental.graph_transformers import LLMGraphTransformer
+
+# ==============================================================================
+# Page Configuration
+# ==============================================================================
+st.set_page_config(
+    page_title="Hybrid RAG: Vector DB + NetworkX Graph (Gemini)",
+    page_icon="🕸️",
+    layout="wide"
+)
+
+# ==============================================================================
+# Session State Initialization
+# ==============================================================================
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "vector_db" not in st.session_state:
+    st.session_state.vector_db = None
+if "graph" not in st.session_state:
+    st.session_state.graph = nx.DiGraph()
+if "indexed" not in st.session_state:
+    st.session_state.indexed = False
+if "persistence_loaded" not in st.session_state:
+    st.session_state.persistence_loaded = False
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(CHROMA_DIR, exist_ok=True)
+
+# ==============================================================================
+# Helper Functions: Robust File Parsers
+# ==============================================================================
+def save_uploaded_files(uploaded_files):
+    for uploaded_file in uploaded_files:
+        filename = os.path.basename(uploaded_file.name.replace("\\", "/"))
+        if not filename:
+            raise ValueError("Uploaded file must have a valid filename.")
+        destination = os.path.join(UPLOAD_DIR, filename)
+        with open(destination, "wb") as file:
+            file.write(uploaded_file.getbuffer())
+
+def get_saved_file_paths():
+    supported_extensions = {".pdf", ".docx", ".doc", ".txt", ".md"}
+    return [
+        os.path.join(UPLOAD_DIR, filename)
+        for filename in sorted(os.listdir(UPLOAD_DIR))
+        if os.path.isfile(os.path.join(UPLOAD_DIR, filename))
+        and os.path.splitext(filename)[1].lower() in supported_extensions
+    ]
+
+def parse_document_file(file_path):
+    docs = []
+    filename = os.path.basename(file_path)
+    file_ext = os.path.splitext(filename)[1].lower()
+
+    if file_ext == ".pdf":
+        reader = pypdf.PdfReader(file_path)
+        text = ""
+        for i, page in enumerate(reader.pages):
+            page_text = page.extract_text()
+            if page_text:
+                text += f"\n--- Page {i+1} ---\n" + page_text
+        if text.strip():
+            docs.append(Document(page_content=text, metadata={"source": filename}))
+
+    elif file_ext in {".docx", ".doc"}:
+        doc = DocxDocument(file_path)
+        text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        if text.strip():
+            docs.append(Document(page_content=text, metadata={"source": filename}))
+
+    elif file_ext in {".txt", ".md"}:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+            text = file.read()
+        if text.strip():
+            docs.append(Document(page_content=text, metadata={"source": filename}))
+            
+    return docs
+
+def restore_persisted_data():
+    if os.path.exists(GRAPH_PATH):
+        st.session_state.graph = nx.read_graphml(GRAPH_PATH)
+
+    if not GEMINI_API_KEY:
+        return
+
+    embeddings = GoogleGenerativeAIEmbeddings(model="embedding-001")
+    vector_db = Chroma(
+        persist_directory=CHROMA_DIR,
+        embedding_function=embeddings,
+    )
+    if vector_db.get(limit=1)["ids"]:
+        st.session_state.vector_db = vector_db
+        st.session_state.indexed = True
+
+if not st.session_state.persistence_loaded:
+    try:
+        restore_persisted_data()
+    except Exception as e:
+        st.error(f"Error restoring persisted documents and indices: {e}")
+    st.session_state.persistence_loaded = True
+
+# ==============================================================================
+# Helper Functions: NetworkX Graph Queries
+# ==============================================================================
+def query_networkx_graph(G, query_text):
+    """Searches NetworkX graph for edges matching keywords in the query."""
+    query_words = set(re.findall(r'\w+', query_text.lower()))
+    matching_relations = []
+    for u, v, data in G.edges(data=True):
+        relation_type = data.get("relation", "RELATED")
+        u_match = any(word in u.lower() for word in query_words if len(word) > 2)
+        v_match = any(word in v.lower() for word in query_words if len(word) > 2)
+        if u_match or v_match:
+            matching_relations.append(f"({u}) -[{relation_type}]-> ({v})")
+            
+    return matching_relations[:25]
+
+# ==============================================================================
+# UI Layout: Sidebar Configuration
+# ==============================================================================
+st.title("🧠 Hybrid RAG Studio (Vector DB + NetworkX + Gemini)")
+
+with st.sidebar:
+    st.header("System Status")
+    st.write(f"- **Gemini API Key:** {'✅ Loaded' if GEMINI_API_KEY else '❌ Missing'}")
+    st.write(f"- **Graph Engine:** `NetworkX (In-Memory)`")
+
+    st.divider()
+    st.header("Document Ingestion")
+    uploaded_files = st.file_uploader(
+        "Upload Documents (.pdf, .docx, .txt, .md)",
+        type=["pdf", "docx", "doc", "txt", "md"],
+        accept_multiple_files=True
+    )
+    saved_file_paths = get_saved_file_paths()
+    if saved_file_paths:
+        st.caption("Saved documents (available after restarting the app):")
+        for file_path in saved_file_paths:
+            st.write(f"- {os.path.basename(file_path)}")
+    
+    chunk_size = st.slider("Chunk Size", min_value=200, max_value=2000, value=800, step=100)
+    chunk_overlap = st.slider("Chunk Overlap", min_value=0, max_value=400, value=100, step=20)
+    
+    process_button = st.button("🚀 Process & Index Documents")
+
+# ==============================================================================
+# Document Ingestion Pipeline Orchestration
+# ==============================================================================
+if process_button:
+    if not GEMINI_API_KEY:
+        st.error("Gemini API Key is missing. Check your environment or .env file (set GEMINI_API_KEY).")
+    else:
+        with st.spinner("Parsing documents & building Hybrid Vector + NetworkX Graph Indices with Gemini..."):
+            try:
+                if uploaded_files:
+                    save_uploaded_files(uploaded_files)
+                saved_file_paths = get_saved_file_paths()
+                if not saved_file_paths:
+                    st.warning("Please upload at least one document.")
+                else:
+                    all_docs = []
+                    for file_path in saved_file_paths:
+                        docs = parse_document_file(file_path)
+                        all_docs.extend(docs)
+
+                    if not all_docs:
+                        st.error("No extractable text found in the uploaded files.")
+                    else:
+                        text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+                        chunks = text_splitter.split_documents(all_docs)
+
+                        # 1. Vector DB Pipeline (Chroma + Google Embeddings)
+                        embeddings = GoogleGenerativeAIEmbeddings(model="embedding-001")
+                        vector_db = Chroma.from_documents(
+                            documents=chunks,
+                            embedding=embeddings,
+                            persist_directory=CHROMA_DIR
+                        )
+                        st.session_state.vector_db = vector_db
+
+                        # 2. NetworkX Knowledge Graph Pipeline via Gemini LLM Transformer
+                        llm = ChatGoogleGenerativeAI(model="gemini-3.8-flash", temperature=0)
+                        transformer = LLMGraphTransformer(llm=llm)
+                        graph_docs = transformer.convert_to_graph_documents(chunks)
+
+                        # Populate NetworkX DiGraph
+                        G = nx.DiGraph()
+                        for gdoc in graph_docs:
+                            for node in gdoc.nodes:
+                                G.add_node(node.id, type=node.type)
+                            for rel in gdoc.relationships:
+                                G.add_edge(rel.source.id, rel.target.id, relation=rel.type)
+
+                        st.session_state.graph = G
+                        nx.write_graphml(G, GRAPH_PATH)
+                        st.session_state.indexed = True
+                        st.success(f"Processing Complete! Created {len(chunks)} vector chunks & {G.number_of_nodes()} graph nodes.")
+
+            except Exception as e:
+                st.error(f"Error during ingestion pipeline: {e}")
+
+# ==============================================================================
+# UI Navigation Tabs
+# ==============================================================================
+tab_chat, tab_graph, tab_info = st.tabs(["💬 Hybrid RAG Chat", "🕸️ Interactive Graph Explorer", "ℹ️ System Info"])
+
+with tab_chat:
+    st.markdown("### Ask Questions Across Vector Context and Knowledge Graph")
+    
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    user_query = st.chat_input("Ask a question about your documents...")
+    if user_query:
+        st.session_state.messages.append({"role": "user", "content": user_query})
+        with st.chat_message("user"):
+            st.markdown(user_query)
+
+        if not st.session_state.get("indexed", False):
+            response = "⚠️ Please upload and index documents using the sidebar first."
+            st.session_state.messages.append({"role": "assistant", "content": response})
+            with st.chat_message("assistant"):
+                st.markdown(response)
+        else:
+            with st.chat_message("assistant"):
+                with st.spinner("Retrieving semantic vector & structural graph knowledge..."):
+                    # 1. Vector Search Retrieval
+                    vector_results = st.session_state.vector_db.similarity_search(user_query, k=3)
+                    vector_context = "\n\n".join([f"Chunk {i+1}:\n" + doc.page_content for i, doc in enumerate(vector_results)])
+
+                    # 2. NetworkX Graph Traversal
+                    graph_tuples = query_networkx_graph(st.session_state.graph, user_query)
+                    graph_context = "\n".join(graph_tuples) if graph_tuples else "No direct entity relationships matched in the NetworkX graph."
+
+                    # 3. Hybrid Context Synthesis using Gemini
+                    hybrid_prompt = f"""
+You are an advanced AI assistant utilizing a Hybrid RAG framework. Synthesize a comprehensive answer using BOTH the vector similarity chunks and structural Knowledge Graph triplets provided below.
+
+### 1. Vector Semantic Context (Document Chunks):
+{vector_context}
+
+### 2. Knowledge Graph Context (Extracted Entity Relationships):
+{graph_context}
+
+### User Query:
+{user_query}
+
+### Formulated Answer:
+"""
+                    llm = ChatGoogleGenerativeAI(model="gemini-3.8-flash", temperature=0.2)
+                    response_obj = llm.invoke(hybrid_prompt)
+                    final_answer = response_obj.content
+
+                    st.markdown(final_answer)
+
+                    with st.expander("🔍 View Retrieved Hybrid Context Details"):
+                        st.subheader("Semantic Vector Chunks")
+                        st.text(vector_context)
+                        st.subheader("Knowledge Graph Triplets")
+                        st.text(graph_context)
+
+                    st.session_state.messages.append({"role": "assistant", "content": final_answer})
+
+with tab_graph:
+    st.markdown("### NetworkX Knowledge Graph Visualizer")
+    
+    if st.session_state.get("indexed", False) and len(st.session_state.graph.nodes) > 0:
+        if st.button("🔄 Refresh Graph View"):
+            st.rerun()
+            
+        G = st.session_state.graph
+        fig, ax = plt.subplots(figsize=(12, 7))
+        pos = nx.spring_layout(G, k=0.4, seed=42)
+        
+        nx.draw_networkx_nodes(G, pos, node_size=800, node_color="#4CAF50", alpha=0.9, ax=ax)
+        nx.draw_networkx_edges(G, pos, width=1.5, alpha=0.5, edge_color="gray", ax=ax, arrows=True)
+        nx.draw_networkx_labels(G, pos, font_size=8, font_weight="bold", ax=ax)
+        
+        edge_labels = nx.get_edge_attributes(G, 'relation')
+        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=6, ax=ax)
+        
+        plt.title("Extracted In-Memory Entities and Relationships", fontsize=12)
+        plt.axis("off")
+        st.pyplot(fig)
+    else:
+        st.info("Please complete the document ingestion step in the sidebar to render the graph visualization.")
+
+with tab_info:
+    st.markdown("### System Configuration Status")
+    st.write(f"- **Gemini API Key Configured:** {'✅ Yes' if GEMINI_API_KEY else '❌ No'}")
+    st.write(f"- **Graph Backend:** NetworkX (In-Memory)")
+    st.write(f"- **Documents Indexed:** {'✅ Yes' if st.session_state.get('indexed') else '❌ No'}")
+    if st.session_state.get("indexed"):
+        st.write(f"- **Total Graph Nodes:** {st.session_state.graph.number_of_nodes()}")
+        st.write(f"- **Total Graph Edges:** {st.session_state.graph.number_of_edges()}")
